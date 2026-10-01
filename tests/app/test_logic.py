@@ -103,3 +103,48 @@ def test_start_nao_lanca_excecao():
 def test_end_nao_lanca_excecao():
     state = make_state((5, 4), (4, 4))
     end(state)  # deve completar sem exceção
+
+
+# --- Cenários da estratégia ---
+
+def snake(id: str, body: list[tuple[int, int]], health: int = 100) -> Snake:
+    coords = [Coord(x=x, y=y) for x, y in body]
+    return Snake(id=id, name=id, health=health, body=coords, head=coords[0], length=len(coords))
+
+
+def arena(me: Snake, *opponents: Snake) -> GameState:
+    """Estado com a gente (`me`) e os adversários, sem comida."""
+    return GameState(
+        game=Game(id="teste", timeout=500),
+        turn=4,
+        board=Board(height=11, width=11, food=[], hazards=[], snakes=[me, *opponents]),
+        you=me,
+    )
+
+
+def test_evita_head_to_head_com_cobra_maior():
+    # Adversário maior com a cabeça em (7,5): a casa (6,5) é disputada.
+    me = snake("eu", [(5, 5), (4, 5), (3, 5)])
+    big = snake("grande", [(7, 5), (8, 5), (9, 5), (10, 5), (10, 4)])
+    assert get_move(arena(me, big)).move != "right"
+
+
+def test_evita_beco():
+    # Esquerda leva a um bolsão de 5 casas, fechado pelo corpo do adversário
+    # (que acabou de comer, então a cauda não sai): cabem menos casas que o
+    # nosso corpo (6). Subir é a única saída boa.
+    me = snake("eu", [(3, 0), (4, 0), (5, 0), (6, 0), (7, 0), (8, 0)])
+    wall = snake("parede", [(0, 4), (0, 3), (0, 2), (1, 2), (2, 2), (2, 1), (2, 1)])
+    assert get_move(arena(me, wall)).move == "up"
+
+
+def test_cauda_conta_como_casa_livre():
+    # Enrolada no canto: a única saída é a casa onde está a própria cauda.
+    me = snake("eu", [(0, 0), (0, 1), (1, 1), (1, 0)])
+    assert get_move(arena(me)).move == "right"
+
+
+def test_com_fome_vai_para_a_comida():
+    state = arena(snake("eu", [(5, 5), (5, 4), (5, 3)], health=10))
+    state.board.food = [Coord(x=7, y=5)]
+    assert get_move(state).move == "right"

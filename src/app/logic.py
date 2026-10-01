@@ -8,12 +8,13 @@
 # ESTE É O ARQUIVO QUE VOCÊ VAI EDITAR. Todo o resto do projeto existe
 # só para levar o estado do jogo até as quatro funções abaixo.
 #
-# Para começar, já deixamos pronta a lógica que impede a sua cobra de andar
-# para trás (ela morreria na hora). Os TODOs marcam os próximos passos.
+# Estratégia (pensada para partidas com 4+ cobras): descarta o que mata na
+# hora, evita becos (flood fill) e head-to-head com cobras maiores, e só busca
+# comida quando está com fome ou não é a maior da mesa.
 # Documentação: https://docs.battlesnake.com
 
-import random
 import logging
+from collections import deque
 from .models import GameState, MoveResponse
 
 logger = logging.getLogger(__name__)
@@ -31,10 +32,10 @@ def info() -> dict:
 
     return {
         "apiversion": "1",
-        "author": "",          # TODO: coloque aqui o SEU usuário do Battlesnake
-        "color": "#8B0000",    # TODO: escolha a cor da sua cobra
-        "head": "tiger-king",  # TODO: escolha a cabeça
-        "tail": "hook",        # TODO: escolha a cauda
+        "author": "Tokuji",
+        "color": "#0077B6",  # ciano escuro / azul petróleo
+        "head": "sand-worm",
+        "tail": "round-bum",
         "version": "1.0.0",
     }
 
@@ -51,82 +52,129 @@ def end(state: GameState) -> None:
     logger.info("FIM DE JOGO após %d turnos", state.turn)
 
 
+MOVES = [("up", 0, 1), ("down", 0, -1), ("left", -1, 0), ("right", 1, 0)]
+
+# Pesos da pontuação. Ordem de gravidade: beco > head-to-head > o resto.
+TRAP = -1000  # espaço alcançável menor que o nosso corpo
+H2H_BIGGER = -500  # casa que um adversário maior alcança junto com a gente
+H2H_EQUAL = -300  # empate de tamanho: morrem os dois
+H2H_SMALLER = 10  # adversário menor: o head-to-head é nosso
+HAZARD = -20
+HUNGER_MARGIN = 15  # vida que queremos sobrando ao chegar na comida
+
+
+def _distance(a: tuple[int, int], b: tuple[int, int]) -> int:
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+def _blocked_cells(state: GameState) -> set[tuple[int, int]]:
+    """Casas ocupadas do tabuleiro neste turno."""
+    blocked = set()
+    for snake in [state.you, *state.board.snakes]:
+        body = [(c.x, c.y) for c in snake.body]
+        # A cauda sai do lugar neste turno, a não ser que a cobra tenha
+        # acabado de comer (aí os dois últimos segmentos ficam empilhados).
+        tail_moves = len(body) >= 2 and body[-1] != body[-2]
+        blocked.update(body[:-1] if tail_moves else body)
+    return blocked
+
+
+# ponytail: os corpos ficam parados no BFS; casas que liberam com o tempo
+# (caudas andando) não contam. Pessimista em espaço apertado.
+def _bfs(start, free):
+    """Gera (casa, distância) de cada casa livre alcançável a partir de `start`."""
+    seen = {start}
+    queue = deque([(start, 0)])
+    while queue:
+        cell, d = queue.popleft()
+        yield cell, d
+        for _, dx, dy in MOVES:
+            nxt = (cell[0] + dx, cell[1] + dy)
+            if nxt not in seen and free(nxt):
+                seen.add(nxt)
+                queue.append((nxt, d + 1))
+
+
 def get_move(state: GameState) -> MoveResponse:
     """POST /move — chamado a cada turno. Aqui mora a inteligência da sua cobra.
     Precisa devolver "up", "down", "left" ou "right".
     Exemplo do JSON recebido: https://docs.battlesnake.com/api/example-move
+
+    Cada direção que não mata na hora ganha uma nota; vence a maior.
     """
-    is_move_safe: dict[str, bool] = {
-        "up": True,
-        "down": True,
-        "left": True,
-        "right": True,
-    }
+    me = state.you
+    head = (me.body[0].x, me.body[0].y)
+    width, height = state.board.width, state.board.height
+    blocked = _blocked_cells(state)
+    food = {(c.x, c.y) for c in state.board.food}
+    hazards = {(c.x, c.y) for c in state.board.hazards}
+    my_len = len(me.body)
+    opponents = [
+        ((s.body[0].x, s.body[0].y), len(s.body))
+        for s in state.board.snakes
+        if s.id != me.id
+    ]
+    biggest_opponent = max((length for _, length in opponents), default=0)
+    hazard_damage = state.game.ruleset.get("settings", {}).get("hazardDamagePerTurn", 14)
 
-    # --- Impedir que a cobra ande para trás (já implementado) ---
-    # O pescoço é a parte do corpo logo atrás da cabeça. Voltar por cima dele
-    # é morte certa, então marcamos aquela direção como insegura.
-    my_head = state.you.body[0]
-    my_neck = state.you.body[1] if len(state.you.body) >= 2 else None
+    def free(cell):
+        x, y = cell
+        return 0 <= x < width and 0 <= y < height and cell not in blocked
 
-    if my_neck is not None:
-        if my_neck.x < my_head.x:
-            # pescoço à esquerda da cabeça -> não vá para a esquerda
-            is_move_safe["left"] = False
-        elif my_neck.x > my_head.x:
-            # pescoço à direita da cabeça -> não vá para a direita
-            is_move_safe["right"] = False
-        elif my_neck.y < my_head.y:
-            # pescoço abaixo da cabeça -> não desça
-            is_move_safe["down"] = False
-        elif my_neck.y > my_head.y:
-            # pescoço acima da cabeça -> não suba
-            is_move_safe["up"] = False
+    best_move, best_score = None, None
+    for name, dx, dy in MOVES:
+        target = (head[0] + dx, head[1] + dy)
+        if not free(target):
+            continue  # parede, pescoço ou corpo: morte certa
+        eats = target in food
+        in_hazard = target in hazards
+        if in_hazard and not eats and me.health <= hazard_damage + 1:
+            continue  # o hazard zera a vida
 
-    # 2. Impedir que a cobra saia do tabuleiro (paredes)
-    board_width = state.board.width
-    board_height = state.board.height
+        score = 0
 
-    if my_head.x + 1 >= board_width:
-        is_move_safe["right"] = False
-    if my_head.x - 1 < 0:
-        is_move_safe["left"] = False
-    if my_head.y + 1 >= board_height:
-        is_move_safe["up"] = False
-    if my_head.y - 1 < 0:
-        is_move_safe["down"] = False
+        for their_head, their_len in opponents:
+            if _distance(their_head, target) == 1:
+                if their_len > my_len:
+                    score += H2H_BIGGER
+                elif their_len == my_len:
+                    score += H2H_EQUAL
+                else:
+                    score += H2H_SMALLER
 
-    # 3. Impedir que a cobra bata no próprio corpo
-    my_body = state.you.body
-    for segment in my_body:
-        if segment.x == my_head.x + 1 and segment.y == my_head.y:
-            is_move_safe["right"] = False
-        if segment.x == my_head.x - 1 and segment.y == my_head.y:
-            is_move_safe["left"] = False
-        if segment.x == my_head.x and segment.y == my_head.y + 1:
-            is_move_safe["up"] = False
-        if segment.x == my_head.x and segment.y == my_head.y - 1:
-            is_move_safe["down"] = False
+        space = sum(1 for _ in _bfs(target, free))
+        if space < my_len:
+            score += TRAP
+        # Espaço acima de 2x o corpo não faz diferença: aí quem decide é a comida.
+        score += min(space, 2 * my_len)
 
-    # TODO: Passo 3 — impedir que a cobra bata nas adversárias
-    # opponents = state.board.snakes
+        if in_hazard:
+            score += HAZARD
 
-    # Sobrou alguma direção segura?
-    safe_moves = [direction for direction, safe in is_move_safe.items() if safe]
+        # Comida mais próxima que nenhum adversário maior/igual alcança antes.
+        food_dist = next(
+            (
+                d
+                for cell, d in _bfs(target, free)
+                if cell in food
+                and not any(
+                    their_len >= my_len and _distance(their_head, cell) <= d + 1
+                    for their_head, their_len in opponents
+                )
+            ),
+            None,
+        )
+        if food_dist is not None:
+            if me.health - 1 - food_dist < HUNGER_MARGIN:
+                score += max(0, 200 - 5 * food_dist)  # fome: comida vira prioridade
+            elif my_len <= biggest_opponent:
+                score += max(0, 40 - 2 * food_dist)  # crescer para ganhar os head-to-heads
 
-    if not safe_moves:
-        # Emergência: todas as direções são perigosas.
-        # Escolhemos uma ao acaso entre as 4 — melhor do que travar.
-        all_moves = ["up", "down", "left", "right"]
-        fallback = random.choice(all_moves)
-        logger.info("MOVE %d: sem saída! emergência -> %s", state.turn, fallback)
-        return MoveResponse(move=fallback)
+        if best_score is None or score > best_score:
+            best_move, best_score = name, score
 
-    # Escolhe uma direção segura ao acaso.
-    chosen = random.choice(safe_moves)
-
-    # TODO: Passo 4 — ir atrás da comida em vez de sortear, para não morrer de fome
-    # food = state.board.food
-
-    logger.debug("MOVE %d: %s", state.turn, chosen)
-    return MoveResponse(move=chosen)
+    if best_move is None:
+        logger.info("MOVE %d: sem saída!", state.turn)
+        return MoveResponse(move="up")
+    logger.debug("MOVE %d: %s (nota %d)", state.turn, best_move, best_score)
+    return MoveResponse(move=best_move)
